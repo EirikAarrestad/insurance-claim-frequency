@@ -1,12 +1,6 @@
 # 01_load_data.R
 # Laster freMTPL2freq, rydder dataene og deler i trening og test.
 # Resultat: data/train.rds og data/test.rds
-#
-# Installer CASdatasets én gang (ligger ikke på CRAN):
-#   install.packages(c("xts", "zoo", "sp"))
-#   install.packages("CASdatasets",
-#                    repos = "https://cas.uqam.ca/pub/", type = "source")
-#   renv::snapshot()
 
 library(CASdatasets)
 
