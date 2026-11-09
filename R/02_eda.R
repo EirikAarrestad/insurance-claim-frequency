@@ -9,7 +9,7 @@ library(ggplot2)
 train <- readRDS("data/train.rds")
 dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
 
-# --- Oversikt ----------------------------------------------------------------
+# --- Oversikt -----------------------------------------------------------------
 
 str(train)
 summary(train)
@@ -20,14 +20,14 @@ round(prop.table(table(train$ClaimNb)), 4)
 # Total skadefrekvens: skader per forsikringsår
 sum(train$ClaimNb) / sum(train$Exposure)
 
-# --- Fordeling av eksponering ------------------------------------------------------
+# --- Fordeling av eksponering -------------------------------------------------
 
 p <- ggplot(train, aes(Exposure)) +
   geom_histogram(bins = 50) +
   labs(x = "Eksponering (år)", y = "Antall forsikringer")
 ggsave("output/figures/exposure.png", p, width = 6, height = 4)
 
-# --- Observert skadefrekvens per variabel ---------------------------------------------
+# --- Observert skadefrekvens per variabel -------------------------------------
 # Frekvens = sum(skader) / sum(eksponering) i hver gruppe.
 # Kontinuerlige variabler deles i intervaller først.
 
