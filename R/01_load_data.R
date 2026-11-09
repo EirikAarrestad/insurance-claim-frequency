@@ -29,6 +29,18 @@ for (v in c("Area", "VehBrand", "VehGas", "Region")) {
 # IDpol er bare en ID og brukes ikke i modellene
 df$IDpol <- NULL
 
+# Grupper kontinuerlige variabler (brukes i EDA, GLM og rapport)
+df$DrivAgeGr <- cut(df$DrivAge, c(17, 21, 26, 31, 41, 51, 71, Inf),
+  labels = c("18–21", "22–26", "27–31", "32–41",
+    "42–51", "52–71", "72+"))
+df$VehAgeGr <- cut(df$VehAge, c(-1, 0, 2, 5, 10, 15, Inf),
+  labels = c("0", "1–2", "3–5", "6–10", "11–15", "16+"))
+df$BonusMalusGr <- cut(df$BonusMalus, c(49, 50, 60, 80, 100, Inf),
+  labels = c("50", "51–60", "61–80", "81–100", "101+"))
+df$DensityGr <- cut(df$Density, c(0, 5, 30, 165, 900, 4900, Inf),
+  labels = c("1–5", "6–30", "31–165", "166–900",
+    "901–4900", "4900+"))
+
 # --- Oppsummering -------------------------------------------------------------
 
 cat("Antall forsikringer:", nrow(df), "\n")
@@ -36,7 +48,7 @@ cat("Total eksponering (år):", round(sum(df$Exposure)), "\n")
 cat("Skadefrekvens per år:", round(sum(df$ClaimNb) / sum(df$Exposure), 4), "\n")
 print(table(df$ClaimNb))
 
-# --- Trening og test -----------------------------------------------------------
+# --- Trening og test ----------------------------------------------------------
 
 # 80/20, samme splitt for alle modeller
 set.seed(42)

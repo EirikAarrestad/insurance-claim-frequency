@@ -1,8 +1,291 @@
 ---
 title: "Skadefrekvens i bilforsikring"
+subtitle: "Poisson-GLM på franske bilansvarsdata"
 author: "Eirik Aarrestad"
-format: html
-editor: visual
+date: today
+lang: nb
+format:
+  html:
+    toc: true
+    number-sections: true
+    code-fold: true
+    fig-width: 7
+    fig-height: 4
+    embed-resources: true
+execute:
+  warning: false
+  message: false
 ---
 
-## 
+```{r}
+#| label: setup
+library(dplyr)
+library(ggplot2)
+library(knitr)
+
+train <- readRDS("../data/train.rds")
+test  <- readRDS("../data/test.rds")
+
+theme_set(theme_minimal(base_size = 12))
+fill_col <- "#3B7DB5"
+
+# Tall med norsk desimalkomma og mellomrom som tusenskille
+fmt <- function(x, digits = 3) {
+  formatC(x, format = "f", digits = digits, decimal.mark = ",", big.mark = " ")
+}
+pct <- function(x, digits = 1) paste0(fmt(100 * x, digits), " %")
+
+# Grupper kontinuerlige variabler i intervaller med lesbare navn
+train <- train |>
+  mutate(
+    DrivAgeGr = cut(DrivAge, c(17, 21, 26, 31, 41, 51, 71, Inf),
+                    labels = c("18–21", "22–26", "27–31", "32–41",
+                               "42–51", "52–71", "72+")),
+    VehAgeGr = cut(VehAge, c(-1, 0, 2, 5, 10, 15, Inf),
+                   labels = c("0", "1–2", "3–5", "6–10", "11–15", "16+")),
+    BonusMalusGr = cut(BonusMalus, c(49, 50, 60, 80, 100, Inf),
+                       labels = c("50", "51–60", "61–80", "81–100", "101+")),
+    DensityGr = cut(Density, c(0, 5, 30, 165, 900, 4900, Inf),
+                    labels = c("1–5", "6–30", "31–165", "166–900",
+                               "901–4900", "4900+")),
+    VehPowerF = factor(VehPower),
+    VehBrand = factor(VehBrand, levels = paste0("B", c(1:6, 10:14)))
+  )
+
+# Skadefrekvens: antall skader per forsikringsår
+total_freq <- sum(train$ClaimNb) / sum(train$Exposure)
+
+freq_table <- function(var) {
+  train |>
+    group_by({{ var }}) |>
+    summarise(
+      eksponering = sum(Exposure),
+      skader = sum(ClaimNb),
+      frekvens = skader / eksponering,
+      .groups = "drop"
+    )
+}
+
+# Søylediagram med total skadefrekvens som stiplet linje
+plot_freq <- function(tab, var, xlab) {
+  ggplot(tab, aes(x = {{ var }}, y = frekvens)) +
+    geom_col(fill = fill_col) +
+    geom_hline(yintercept = total_freq, linetype = "dashed") +
+    labs(x = xlab, y = "Skader per forsikringsår")
+}
+```
+
+## Innledning
+
+Et forsikringsselskap må sette en pris før det vet hvilke kunder som kommer til å melde skader. Den forventede kostnaden for en kunde deles vanligvis i to: hvor ofte kunden melder skader (*skadefrekvens*) og hvor mye hver skade koster (*skadestørrelse*). Prisen bygger på produktet av de to.
+
+Dette prosjektet ser på den første delen. Målet er å forstå hvilke egenskaper ved fører, kjøretøy og bosted som påvirker hvor ofte det meldes skader, og å bygge en modell som kan predikere skadefrekvensen for nye kunder. Hovedmodellen er en Poisson-GLM, som er standardmetoden for frekvensmodellering i forsikringsbransjen.
+
+Prosjektet bygger på casestudien til Noll, Salzmann og Wüthrich (2018), som bruker det samme datasettet.
+
+## Data
+
+Datasettet `freMTPL2freq` fra R-pakken `CASdatasets` inneholder `r fmt(nrow(train) + nrow(test), 0)` franske bilansvarsforsikringer. Hver rad er én forsikring med antall meldte skader, hvor lenge forsikringen var aktiv, og egenskaper ved fører, kjøretøy og bosted.
+
+| Variabel | Beskrivelse |
+|------------------------------------|------------------------------------|
+| `ClaimNb` | Antall meldte skader (responsvariabel) |
+| `Exposure` | Hvor lenge forsikringen var aktiv, i år |
+| `DrivAge` | Førerens alder |
+| `BonusMalus` | Bonus/malus-nivå, fra 50 (full bonus) og oppover. 100 er startnivå, over 100 er malus |
+| `VehAge` | Bilens alder i år |
+| `VehPower` | Bilens effektklasse |
+| `VehBrand` | Bilmerke (anonymisert) |
+| `VehGas` | Drivstoff: diesel eller bensin |
+| `Area` | Områdekode fra A til F |
+| `Density` | Befolkningstetthet i førerens kommune (innbyggere per km²) |
+| `Region` | Fransk region |
+
+To variabler er kappet, som i Noll mfl. (2018): `Exposure` på 1 år, siden noen få verdier over 1 trolig er feil, og `ClaimNb` på 4 skader, siden høyere tall er svært sjeldne og trolig feilregistreringer. Se `R/01_load_data.R`.
+
+Dataene er delt tilfeldig i et treningssett (80 %, `r fmt(nrow(train), 0)` forsikringer) og et testsett (20 %, `r fmt(nrow(test), 0)` forsikringer). All utforskning og modelltilpasning gjøres på treningssettet. Testsettet brukes bare til å evaluere de ferdige modellene, slik at evalueringen gir et ærlig bilde av hvor godt modellene fungerer på nye kunder.
+
+## Utforskende analyse
+
+### Skadeantall og eksponering
+
+```{r}
+#| label: tbl-claims
+#| tbl-cap: "Fordeling av antall skader per forsikring i treningssettet."
+train |>
+  count(ClaimNb, name = "Antall forsikringer") |>
+  mutate(Andel = pct(`Antall forsikringer` / sum(`Antall forsikringer`), 2),
+         `Antall forsikringer` = fmt(`Antall forsikringer`, 0)) |>
+  rename(`Antall skader` = ClaimNb) |>
+  kable(align = "rrr")
+```
+
+Skader er sjeldne. `r pct(mean(train$ClaimNb == 0))` av forsikringene har ingen skader, og bare `r pct(mean(train$ClaimNb >= 2), 2)` har to eller flere (@tbl-claims). Responsvariabelen er altså et lite heltall som oftest er 0, noe som passer godt med en Poisson-fordeling.
+
+```{r}
+#| label: fig-exposure
+#| fig-cap: "Fordeling av eksponering. Mange forsikringer har vært aktive i et helt år, men en stor andel bare deler av året."
+ggplot(train, aes(Exposure)) +
+  geom_histogram(binwidth = 0.02, boundary = 0, fill = fill_col) +
+  scale_y_continuous(labels = function(x) fmt(x, 0)) +
+  labs(x = "Eksponering (år)", y = "Antall forsikringer")
+```
+
+Bare `r pct(mean(train$Exposure == 1))` av forsikringene har vært aktive i et helt år (@fig-exposure). Resten har vært aktive i kortere tid, for eksempel fordi kunden kom til eller sluttet i løpet av året. Dette må tas hensyn til: en kunde som har vært forsikret i en måned, har hatt mye kortere tid på seg til å melde en skade enn en som har vært forsikret i et år.
+
+Derfor måles skadefrekvens i denne rapporten som antall skader per forsikringsår:
+
+$$\hat\lambda = \frac{\sum_i N_i}{\sum_i e_i},$$
+
+der $N_i$ er antall skader og $e_i$ eksponeringen for forsikring $i$. Gjennomsnittet av `ClaimNb` ville undervurdert frekvensen, fordi mange forsikringer bare har vært aktive en del av året. Total skadefrekvens i treningssettet er `r fmt(total_freq)` skader per forsikringsår. I modellene tas eksponeringen inn som et *offset*.
+
+I figurene under viser den stiplede linjen den totale skadefrekvensen.
+
+### Føreren: alder og bonus/malus
+
+```{r}
+#| label: fig-driver
+#| fig-cap: "Skadefrekvens etter førerens alder og bonus/malus-nivå."
+#| fig-subcap:
+#|   - "Førerens alder"
+#|   - "Bonus/malus"
+#| layout-ncol: 2
+#| fig-width: 5
+#| fig-height: 4
+tab_age <- freq_table(DrivAgeGr)
+tab_bm  <- freq_table(BonusMalusGr)
+
+plot_freq(tab_age, DrivAgeGr, "Førerens alder")
+plot_freq(tab_bm, BonusMalusGr, "Bonus/malus")
+```
+
+```{r}
+#| label: driver-values
+young   <- tab_age$frekvens[tab_age$DrivAgeGr == "18–21"]
+middle  <- tab_age$frekvens[tab_age$DrivAgeGr == "32–41"]
+bm_full <- tab_bm$frekvens[tab_bm$BonusMalusGr == "50"]
+bm_high <- tab_bm$frekvens[tab_bm$BonusMalusGr == "101+"]
+```
+
+Førerens alder og bonus/malus er de to variablene med tydeligst sammenheng med skadefrekvensen (@fig-driver).
+
+- **Alder:** Førere mellom 18 og 21 år har en skadefrekvens på `r fmt(young)`, omtrent `r fmt(young / middle, 1)` ganger så høy som førere mellom 32 og 41 år (`r fmt(middle)`). Frekvensen faller raskt frem til slutten av 20-årene og er deretter nokså flat. Sammenhengen er altså ikke lineær.
+- **Bonus/malus:** Frekvensen øker jevnt med bonus/malus-nivået. Førere med malus (over 100) har en frekvens på `r fmt(bm_high)`, omtrent `r fmt(bm_high / bm_full, 1)` ganger så høy som førere med full bonus (`r fmt(bm_full)`). Det er ventet, siden bonus/malus-nivået nettopp bygger på tidligere skader.
+
+De to variablene henger sammen. I det franske bonus/malus-systemet starter nye førere på 100, og nivået synker for hvert skadefritt år. Unge førere har derfor høyere bonus/malus i snitt (@tbl-age-bm).
+
+```{r}
+#| label: tbl-age-bm
+#| tbl-cap: "Bonus/malus etter førerens alder."
+train |>
+  group_by(`Førerens alder` = DrivAgeGr) |>
+  summarise(
+    `Snitt bonus/malus` = fmt(mean(BonusMalus), 1),
+    `Andel med malus (over 100)` = pct(mean(BonusMalus > 100)),
+    .groups = "drop"
+  ) |>
+  kable(align = "lrr")
+```
+
+Det betyr at figurene over delvis viser den samme effekten to ganger: noe av den høye frekvensen blant unge førere skyldes at de også har høy bonus/malus, og omvendt. Søylediagrammer viser bare én variabel om gangen og kan ikke skille effektene fra hverandre. Det kan en modell med begge variablene samtidig, som GLM-en i neste del.
+
+### Bosted: områdekode og befolkningstetthet
+
+```{r}
+#| label: fig-area
+#| fig-cap: "Skadefrekvens etter områdekode og befolkningstetthet."
+#| fig-subcap:
+#|   - "Områdekode"
+#|   - "Befolkningstetthet (innbyggere per km²)"
+#| layout-ncol: 2
+#| fig-width: 5
+#| fig-height: 4
+plot_freq(freq_table(Area), Area, "Områdekode")
+plot_freq(freq_table(DensityGr), DensityGr, "Befolkningstetthet") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+Skadefrekvensen øker fra område A til F, og stort sett også med befolkningstettheten (@fig-area). Det gir mening: i tettbygde strøk er det mer trafikk og flere situasjoner der skader kan oppstå. Unntaket er de mest grisgrendte kommunene (1–5 innbyggere per km²), som har høyere frekvens enn neste gruppe.
+
+```{r}
+#| label: tbl-area-density
+#| tbl-cap: "Befolkningstetthet etter områdekode."
+train |>
+  group_by(`Områdekode` = Area) |>
+  summarise(
+    `Median tetthet` = fmt(median(Density), 0),
+    `Antall forsikringer` = fmt(n(), 0),
+    .groups = "drop"
+  ) |>
+  kable(align = "lrr")
+```
+
+Områdekoden og tettheten måler nesten det samme: medianen for tettheten øker jevnt fra A til F (@tbl-area-density). Å ta med begge i samme modell gir lite ny informasjon og gjør koeffisientene vanskeligere å tolke. I modellen brukes derfor bare én av dem.
+
+### Kjøretøyet
+
+```{r}
+#| label: fig-vehicle
+#| fig-cap: "Skadefrekvens etter egenskaper ved kjøretøyet."
+#| fig-subcap:
+#|   - "Bilens alder (år)"
+#|   - "Effektklasse"
+#|   - "Drivstoff"
+#|   - "Bilmerke"
+#| layout-ncol: 2
+#| fig-width: 5
+#| fig-height: 3.5
+tab_brand <- freq_table(VehBrand)
+
+plot_freq(freq_table(VehAgeGr), VehAgeGr, "Bilens alder (år)")
+plot_freq(freq_table(VehPowerF), VehPowerF, "Effektklasse")
+plot_freq(freq_table(VehGas), VehGas, "Drivstoff")
+plot_freq(tab_brand, VehBrand, "Bilmerke")
+```
+
+Kjøretøyvariablene har svakere sammenheng med skadefrekvensen enn førervariablene (@fig-vehicle):
+
+- **Bilens alder:** Frekvensen er nokså lik for biler opp til 15 år, men lavere for eldre biler. En mulig forklaring er at eldre biler kjøres mindre.
+- **Effektklasse:** Svak tendens til høyere frekvens for kraftigere biler.
+- **Drivstoff:** Dieselbiler har litt høyere frekvens enn bensinbiler, kanskje fordi dieselbiler ofte brukes av dem som kjører mye.
+- **Bilmerke:** Frekvensen varierer fra `r fmt(min(tab_brand$frekvens))` (`r as.character(tab_brand$VehBrand[which.min(tab_brand$frekvens)])`) til `r fmt(max(tab_brand$frekvens))` (`r as.character(tab_brand$VehBrand[which.max(tab_brand$frekvens)])`). Merkene er anonymisert, så forskjellene er vanskelige å tolke.
+
+### Region
+
+```{r}
+#| label: fig-region
+#| fig-cap: "Skadefrekvens etter region, sortert."
+#| fig-height: 5.5
+tab_reg <- freq_table(Region) |>
+  mutate(Region = reorder(Region, frekvens))
+
+plot_freq(tab_reg, Region, "Region") +
+  coord_flip()
+```
+
+Skadefrekvensen varierer mellom regionene, fra `r fmt(min(tab_reg$frekvens))` i `r as.character(tab_reg$Region[which.min(tab_reg$frekvens)])` til `r fmt(max(tab_reg$frekvens))` i `r as.character(tab_reg$Region[which.max(tab_reg$frekvens)])` (@fig-region). Noe av forskjellen henger trolig sammen med befolkningstetthet, siden regioner med store byer ligger høyt.
+
+### Oppsummering
+
+Analysen gir fire føringer for modelleringen:
+
+1.  **Eksponeringen må tas med** som offset, siden forsikringene har vært aktive i ulik tid.
+2.  **Sammenhengene er ikke lineære**, særlig for alder. Alder, bilens alder og bonus/malus tas derfor inn som grupperte variabler.
+3.  **Alder og bonus/malus overlapper.** En modell med flere variabler samtidig trengs for å skille effektene.
+4.  **Områdekode og tetthet måler nesten det samme**, så bare én av dem tas med.
+
+## Metode
+
+*Kommer.*
+
+## Resultater
+
+*Kommer.*
+
+## Diskusjon
+
+*Kommer.*
+
+## Referanser
+
+Noll, A., Salzmann, R. og Wüthrich, M. V. (2018). *Case Study: French Motor Third-Party Liability Claims*. SSRN.
