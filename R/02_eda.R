@@ -9,7 +9,7 @@ library(ggplot2)
 train <- readRDS("data/train.rds")
 dir.create("output/figures", recursive = TRUE, showWarnings = FALSE)
 
-# --- Oversikt -----------------------------------------------------------------
+# --- Oversikt ----------------------------------------------------------------
 
 str(train)
 summary(train)
@@ -20,24 +20,16 @@ round(prop.table(table(train$ClaimNb)), 4)
 # Total skadefrekvens: skader per forsikringsår
 sum(train$ClaimNb) / sum(train$Exposure)
 
-# --- Fordeling av eksponering -------------------------------------------------
+# --- Fordeling av eksponering ------------------------------------------------------
 
 p <- ggplot(train, aes(Exposure)) +
   geom_histogram(bins = 50) +
   labs(x = "Eksponering (år)", y = "Antall forsikringer")
 ggsave("output/figures/exposure.png", p, width = 6, height = 4)
 
-# --- Observert skadefrekvens per variabel -------------------------------------
+# --- Observert skadefrekvens per variabel ---------------------------------------------
 # Frekvens = sum(skader) / sum(eksponering) i hver gruppe.
-# Kontinuerlige variabler deles i intervaller først.
-
-train <- train |>
-  mutate(
-    DrivAgeGr    = cut(DrivAge, c(17, 21, 26, 31, 41, 51, 71, Inf)),
-    VehAgeGr     = cut(VehAge, c(-1, 0, 2, 5, 10, 15, Inf)),
-    BonusMalusGr = cut(BonusMalus, c(49, 50, 60, 80, 100, Inf)),
-    DensityGr    = cut(log(Density), 6)
-  )
+# De grupperte variablene (DrivAgeGr osv.) lages i 01_load_data.R.
 
 freq_by <- function(var) {
   train |>

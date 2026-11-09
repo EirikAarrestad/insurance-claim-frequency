@@ -48,7 +48,7 @@ cat("Total eksponering (år):", round(sum(df$Exposure)), "\n")
 cat("Skadefrekvens per år:", round(sum(df$ClaimNb) / sum(df$Exposure), 4), "\n")
 print(table(df$ClaimNb))
 
-# --- Trening og test ----------------------------------------------------------
+# --- Trening og test -----------------------------------------------------------
 
 # 80/20, samme splitt for alle modeller
 set.seed(42)
