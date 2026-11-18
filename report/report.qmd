@@ -1,6 +1,6 @@
 ---
 title: "Skadefrekvens i bilforsikring"
-subtitle: "Poisson-GLM på franske bilansvarsdata"
+subtitle: "Poisson-GLM og gradient boosting på franske bilansvarsdata"
 author: "Eirik Aarrestad"
 date: today
 lang: nb
@@ -70,7 +70,7 @@ plot_freq <- function(tab, var, xlab) {
 
 Et forsikringsselskap må sette en pris før det vet hvilke kunder som kommer til å melde skader. Den forventede kostnaden for en kunde deles vanligvis i to: hvor ofte kunden melder skader (*skadefrekvens*) og hvor mye hver skade koster (*skadestørrelse*). Prisen bygger på produktet av de to.
 
-Dette prosjektet ser på den første delen. Målet er å forstå hvilke egenskaper ved fører, kjøretøy og bosted som påvirker hvor ofte det meldes skader, og å bygge en modell som kan predikere skadefrekvensen for nye kunder. Hovedmodellen er en Poisson-GLM, som er standardmetoden for frekvensmodellering i forsikringsbransjen.
+Dette prosjektet ser på den første delen. Målet er å forstå hvilke egenskaper ved fører, kjøretøy og bosted som påvirker hvor ofte det meldes skader, og å bygge en modell som kan predikere skadefrekvensen for nye kunder. Hovedmodellen er en Poisson-GLM, som er standardmetoden for frekvensmodellering i forsikringsbransjen. Den sammenlignes med gradient boosting (xgboost), en maskinlæringsmetode som selv finner ikke-lineære sammenhenger og samspill, for å se hva GLM-en eventuelt går glipp av.
 
 Prosjektet bygger på casestudien til Noll, Salzmann og Wüthrich (2018), som bruker det samme datasettet.
 
@@ -322,11 +322,28 @@ Tre modeller sammenlignes:
 2.  **Førervariabler:** alder og bonus/malus.
 3.  **Full GLM:** alle variablene over.
 
+I tillegg sammenlignes den fulle GLM-en med en gradient boosting-modell med de samme variablene (se under).
+
 ### Overdispersjon
 
 Poisson-fordelingen har varians lik forventning. Hvis variansen i dataene er større, er det *overdispersjon*. Koeffisientene er fortsatt forventningsrette, men standardfeilene blir for små, og konfidensintervallene for smale.
 
 Dispersjonen anslås som $\hat\phi = \frac{1}{n - p} \sum_i r_i^2$, der $r_i$ er Pearson-residualene og $p$ antall parametere. Konfidensintervaller og tester er beregnet med en quasi-Poisson-modell, som antar $\text{Var}(N_i) = \phi \, \mathbb{E}[N_i]$. Den gir de samme koeffisientene som Poisson-modellen, men skalerer standardfeilene med $\sqrt{\hat\phi}$. Bidraget fra hver variabel testes med en F-test, quasi-Poisson-versjonen av likelihood ratio-testen.
+
+### Gradient boosting
+
+Som sammenligning tilpasses en gradient boosting-modell (GBM) med pakken `xgboost` (Chen og Guestrin, 2016). En GBM er en sum av mange små regresjonstrær, der hvert nye tre tilpasses slik at det retter opp feilene til trærne før (Friedman, 2001). Modellen bruker samme Poisson-likelihood, log-lenke og offset som GLM-en:
+
+$$\log \mathbb{E}[N_i] = \log e_i + \sum_{k=1}^{K} f_k(\mathbf{x}_i),$$
+
+der hver $f_k$ er et tre. Forskjellen er at modellen ikke antar at effektene er lineære i de grupperte variablene, eller at de ganges sammen uavhengig av hverandre. Et tre med dybde $d$ kan fange opp samspill mellom opptil $d$ variabler. Derfor brukes de rå variablene i stedet for de grupperte, slik at trærne selv finner hvor det er naturlig å dele.
+
+Tredybde (2–5) og antall trær velges med 5-fold kryssvalidering på treningssettet. Antall trær velges med *early stopping*: det legges til trær helt til valideringsfeilen ikke har blitt bedre på 50 runder. Læringsraten er 0,05, og hvert tre bygges på et tilfeldig utvalg av 80 % av radene og variablene, noe som gjør modellen mindre utsatt for overtilpasning. Testsettet brukes ikke i tuningen, så sammenligningen med GLM-en på testdata er rettferdig.
+
+Prisen for fleksibiliteten er at modellen ikke har koeffisienter som kan leses direkte. Den tolkes i stedet med to verktøy:
+
+- **Variabelviktighet (gain):** hvor mye hver variabel totalt forbedrer tapsfunksjonen i splittene der den brukes.
+- **Partial dependence:** gjennomsnittlig predikert frekvens når én variabel settes til samme verdi for alle kundene, mens de andre variablene beholder sine faktiske verdier (Friedman, 2001). Det gir en kurve som kan sammenlignes med de relative risikoene fra GLM-en. Kurvene er beregnet på et tilfeldig utvalg av 10 000 forsikringer fra treningssettet.
 
 ### Evaluering
 
@@ -460,10 +477,233 @@ ggplot(cal_long, aes(x = alder, y = frekvens, fill = type)) +
 
 Modellen predikerer `r fmt(glm_res$totals[["predikert"]], 0)` skader i testsettet, mot `r fmt(glm_res$totals[["observert"]], 0)` observerte, et avvik på `r pct(abs(glm_res$totals[["predikert"]] / glm_res$totals[["observert"]] - 1), 1)`. Den treffer også godt innenfor hver aldersgruppe (@fig-calibration), inkludert de unge førerne, der dataene er minst.
 
+### Sammenligning med gradient boosting
+
+```{r}
+#| label: load-gbm
+gbm_res <- readRDS("../output/gbm_results.rds")
+gbm_row <- gbm_res$results
+glm_row <- res[res$modell == "Full GLM", ]
+
+gbm_labels <- c(
+  DrivAge = "Førerens alder", BonusMalus = "Bonus/malus",
+  VehAge = "Bilens alder", VehPower = "Effektklasse",
+  VehGas = "Drivstoff", VehBrand = "Bilmerke",
+  Density = "Befolkningstetthet", Region = "Region"
+)
+```
+
+#### Prediksjonsevne
+
+```{r}
+#| label: tbl-gbm
+#| tbl-cap: "GBM sammenlignet med GLM-modellene. Devians er gjennomsnittlig Poisson-devians. Forbedringen er reduksjonen i devians på testdata sammenlignet med nullmodellen."
+rbind(res, gbm_row) |>
+  transmute(
+    Modell = modell,
+    `Devians trening` = fmt(dev_train, 4),
+    `Devians test` = fmt(dev_test, 4),
+    Forbedring = ifelse(forbedring == 0, "–", pct(forbedring))
+  ) |>
+  kable(row.names = FALSE, align = "lrrr")
+```
+
+```{r}
+#| label: gbm-values
+# Hvor stor del av GBM-ens forbedring over nullmodellen GLM-en også oppnår
+glm_share <- glm_row$forbedring / gbm_row$forbedring
+gap_glm <- glm_row$dev_test - glm_row$dev_train
+gap_gbm <- gbm_row$dev_test - gbm_row$dev_train
+cv <- gbm_res$cv_results
+```
+
+GBM-en reduserer devians på testdata med `r pct(gbm_row$forbedring)` sammenlignet med nullmodellen, mot `r pct(glm_row$forbedring)` for den fulle GLM-en (@tbl-gbm). Deviansen er `r pct(1 - gbm_row$dev_test / glm_row$dev_test)` lavere enn for GLM-en, og GLM-en oppnår bare `r pct(glm_share, 0)` av forbedringen GBM-en gir. Det finnes altså struktur i dataene som GLM-en ikke fanger opp.
+
+GBM-en er mer overtilpasset: forskjellen mellom devians på trening og test er omtrent `r fmt(gap_gbm / gap_glm, 0)` ganger så stor som for GLM-en. Det er ventet for en mer fleksibel modell, og siden deviansen på test likevel er lavere, lønner fleksibiliteten seg.
+
+```{r}
+#| label: tbl-cv
+#| tbl-cap: "5-fold kryssvalidering på treningssettet. Antall trær er valgt med early stopping (maks 1500). Lavere er bedre."
+cv |>
+  transmute(
+    Tredybde = max_depth,
+    `Antall trær` = nrounds,
+    `Negativ log-likelihood (CV)` = fmt(cv_nloglik, 5)
+  ) |>
+  kable(align = "rrr")
+```
+
+Kryssvalideringen valgte tredybde `r gbm_res$best_depth` med `r gbm_res$best_rounds` trær (@tbl-cv). Det er den største dybden som ble testet, men forskjellene mellom dybde 3, 4 og 5 er svært små, så valget betyr lite i praksis. Dybde 2 brukte alle 1500 trærne uten at valideringsfeilen sluttet å falle, og kunne trolig blitt litt bedre med flere trær. Dypere trær trenger færre runder, siden hvert tre fanger opp mer.
+
+#### Variabelviktighet
+
+```{r}
+#| label: fig-importance
+#| fig-cap: "Variabelviktighet i GBM-en, som andel av total gain. Dummyvariablene for de kategoriske variablene er summert."
+imp <- gbm_res$importance |>
+  mutate(label = unname(gbm_labels[variable]))
+
+ggplot(imp, aes(x = Gain, y = reorder(label, Gain))) +
+  geom_col(fill = fill_col) +
+  scale_x_continuous(labels = function(x) pct(x, 0)) +
+  labs(x = "Andel av total gain", y = NULL)
+```
+
+Bonus/malus står alene for `r pct(imp$Gain[imp$variable == "BonusMalus"], 0)` av den totale gainen, og førerens alder er nest viktigst med `r pct(imp$Gain[imp$variable == "DrivAge"], 0)` (@fig-importance). Det stemmer med F-testene for GLM-en, der de samme to var viktigst.
+
+Gain bør likevel tolkes med forsiktighet. Kontinuerlige variabler med mange mulige splittpunkter, som tetthet, kan få høy gain bare fordi trærne har mange måter å bruke dem på. Variabler som henger sammen, som alder og bonus/malus, deler dessuten på æren, slik at fordelingen mellom dem blir noe tilfeldig.
+
+#### Effekten av alder og bonus/malus
+
+```{r}
+#| label: fig-pd
+#| fig-cap: "Partial dependence: gjennomsnittlig predikert skadefrekvens per forsikringsår i GBM-en, når én variabel settes til samme verdi for alle."
+#| fig-subcap:
+#|   - "Førerens alder"
+#|   - "Bonus/malus"
+#| layout-ncol: 2
+#| fig-width: 5
+#| fig-height: 4
+ggplot(gbm_res$pd_age, aes(DrivAge, frekvens)) +
+  geom_line(colour = fill_col, linewidth = 1) +
+  labs(x = "Førerens alder", y = "Skader per forsikringsår")
+
+ggplot(gbm_res$pd_bm, aes(BonusMalus, frekvens)) +
+  geom_line(colour = fill_col, linewidth = 1) +
+  geom_point(colour = fill_col) +
+  labs(x = "Bonus/malus", y = "Skader per forsikringsår")
+```
+
+```{r}
+#| label: pd-values
+pd_age  <- gbm_res$pd_age
+pd_bm   <- gbm_res$pd_bm
+pd_a    <- function(a) pd_age$frekvens[pd_age$DrivAge == a]
+pd_b    <- function(b) pd_bm$frekvens[pd_bm$BonusMalus == b]
+age_min <- pd_age$DrivAge[which.min(pd_age$frekvens)]
+```
+
+Partial dependence-kurvene kan sammenlignes med de relative risikoene fra GLM-en (@fig-pd):
+
+- **Alder:** Frekvensen er `r fmt(pd_a(18))` for en 18-åring og lavest ved `r age_min` år (`r fmt(pd_a(age_min))`), altså `r fmt(pd_a(18) / pd_a(age_min), 1)` ganger så høy for de yngste når de andre variablene holdes like. Deretter øker den igjen, til `r fmt(pd_a(45))` ved 45 år og `r fmt(pd_a(85))` ved 85 år. Mønsteret er det samme som i GLM-en, som fant lavest risiko for `r lowest$level` år og høyere for 42–51 år. GBM-en bruker alder som kontinuerlig variabel og er ikke avhengig av at grupperingen er valgt riktig på forhånd, men den bekrefter at grupperingen i GLM-en fanger hovedtrekkene.
+- **Bonus/malus:** Frekvensen ved 100 er `r fmt(pd_b(100) / pd_b(50), 1)` ganger så høy som ved 50, mot en relativ risiko på `r fmt(get_rr("BonusMalusGrouped", "81–100")$rr, 2)` for gruppen 81–100 i GLM-en. Kurven er likevel ikke monoton: frekvensen er `r fmt(pd_b(75))` ved 75, men bare `r fmt(pd_b(80))` ved 80, og `r fmt(pd_b(105))` ved 105 mot `r fmt(pd_b(110))` ved 110. Bonus/malus er ikke jevnt fordelt, siden nivået endres i faste steg i det franske systemet. For eksempel har `r fmt(sum(train$BonusMalus == 75), 0)` forsikringer i treningssettet nøyaktig 75, mot `r fmt(sum(train$BonusMalus == 80), 0)` med 80. Der det er få forsikringer, kan trærne tilpasse seg tilfeldig støy. Over 125 er det også få forsikringer (`r pct(mean(train$BonusMalus > 125), 2)` av treningssettet), så den delen av kurven er usikker.
+
+En pris som går ned når bonus/malus øker, ville vært vanskelig å forsvare overfor kundene. Dette er et konkret eksempel på hvorfor en GBM ikke kan brukes direkte til prising uten videre kontroll.
+
+#### Samspill mellom alder og bonus/malus
+
+```{r}
+#| label: fig-interaction
+#| fig-cap: "Partial dependence for førerens alder ved tre bonus/malus-nivåer. Logaritmisk skala: parallelle kurver betyr at det ikke er samspill, slik GLM-en antar."
+ggplot(gbm_res$pd_age_bm,
+       aes(DrivAge, frekvens, colour = factor(BonusMalus))) +
+  geom_line(linewidth = 1) +
+  scale_y_log10() +
+  scale_colour_manual(values = c("50" = "#A9C9E8", "80" = "#6A9FD0", "100" = "#1F4E79")) +
+  labs(x = "Førerens alder", y = "Skader per forsikringsår (log-skala)",
+       colour = "Bonus/malus")
+```
+
+```{r}
+#| label: interaction-values
+pd_ab <- gbm_res$pd_age_bm
+pd_at <- function(b, a) pd_ab$frekvens[pd_ab$BonusMalus == b & pd_ab$DrivAge == a]
+r80  <- pd_at(80, 25) / pd_at(80, 50)
+r100 <- pd_at(100, 25) / pd_at(100, 50)
+# GLM-ens forhold mellom tilsvarende aldersgrupper, likt for alle bonus/malus-nivåer
+r_glm <- get_rr("DrivAgeGrouped", "22–26")$rr / get_rr("DrivAgeGrouped", "42–51")$rr
+n_young_full <- sum(train$DrivAge < 30 & train$BonusMalus == 50)
+```
+
+Hvis effekten av alder var uavhengig av bonus/malus, ville kurvene i @fig-interaction vært parallelle på log-skala. GLM-en antar nettopp det: der er forholdet mellom aldersgruppene 22–26 og 42–51 år `r fmt(r_glm, 2)`, uansett bonus/malus-nivå. I GBM-en er forholdet mellom en 25-åring og en 50-åring `r fmt(r80, 2)` ved bonus/malus 80, men `r fmt(r100, 2)` ved bonus/malus 100. Kurvene har altså ulik form, og effekten av alder avhenger av bonus/malus-nivået.
+
+Det stemmer med tolkningen fra GLM-en. En 25-åring med bonus/malus 80 har trolig vært skadefri siden førerkortet, mens en 50-åring på samme nivå sannsynligvis har hatt skader. Ved bonus/malus 100 har derimot begge enten nettopp startet eller hatt skader, og risikoen er nesten lik. Samme bonus/malus-nivå betyr altså ulike ting i ulike aldre, og GLM-en uten samspillsledd fanger ikke opp dette.
+
+Kurven for bonus/malus 50 må leses med forsiktighet for unge førere. Nye førere starter på 100, og nivået synker med omtrent 5 % per skadefritt år, så det tar rundt 14 år å nå 50. Bare `r fmt(n_young_full, 0)` forsikringer i treningssettet har en fører under 30 år med bonus/malus 50. Her ekstrapolerer modellen til kombinasjoner som nesten ikke finnes i dataene. Det er en generell svakhet ved partial dependence når variablene henger sammen.
+
+#### Kalibrering
+
+```{r}
+#| label: fig-calibration-gbm
+#| fig-cap: "Observert og predikert skadefrekvens på testdata for GLM og GBM."
+#| fig-subcap:
+#|   - "Førerens alder"
+#|   - "Bonus/malus"
+#| layout-ncol: 2
+#| fig-width: 5
+#| fig-height: 4
+plot_cal <- function(glm_cal, gbm_cal, lev, xlab) {
+  d <- data.frame(
+    gruppe   = factor(rep(glm_cal$level, 3), levels = lev),
+    type     = factor(rep(c("Observert", "GLM", "GBM"), each = nrow(glm_cal)),
+                      levels = c("Observert", "GLM", "GBM")),
+    frekvens = c(glm_cal$observert, glm_cal$predikert, gbm_cal$predikert)
+  )
+  ggplot(d, aes(gruppe, frekvens, fill = type)) +
+    geom_col(position = "dodge") +
+    scale_fill_manual(values = c(Observert = "grey65", GLM = fill_col, GBM = "#E08A3C")) +
+    labs(x = xlab, y = "Skader per forsikringsår", fill = NULL) +
+    theme(legend.position = "bottom")
+}
+
+plot_cal(glm_res$calibration$age, gbm_res$calibration$age,
+         levels(train$DrivAgeGrouped), "Førerens alder")
+plot_cal(glm_res$calibration$bonus_malus, gbm_res$calibration$bonus_malus,
+         levels(train$BonusMalusGrouped), "Bonus/malus")
+```
+
+```{r}
+#| label: calibration-values
+max_dev <- function(cal) max(abs(cal$predikert / cal$observert - 1))
+malus_dev <- function(cal) {
+  r <- cal[cal$level == "101+", ]
+  r$predikert / r$observert - 1
+}
+gbm_total_dev <- gbm_res$totals[["predikert"]] / gbm_res$totals[["observert"]] - 1
+```
+
+GBM-en predikerer `r fmt(gbm_res$totals[["predikert"]], 0)` skader i testsettet, mot `r fmt(glm_res$totals[["predikert"]], 0)` for GLM-en og `r fmt(gbm_res$totals[["observert"]], 0)` observerte, et avvik på `r pct(abs(gbm_total_dev), 1)`. Det største avviket i en aldersgruppe er `r pct(max_dev(glm_res$calibration$age))` for GLM-en og `r pct(max_dev(gbm_res$calibration$age))` for GBM-en, så begge er godt kalibrert etter alder (@fig-calibration-gbm). For gruppen med malus (101+) predikerer GBM-en derimot `r pct(-malus_dev(gbm_res$calibration$bonus_malus))` for lavt, mot `r pct(-malus_dev(glm_res$calibration$bonus_malus))` for GLM-en. Det er den dyreste gruppen, så her er avviket viktig for prisingen.
+
 ## Diskusjon
 
-*Kommer.*
+### Hva GBM-en tilfører
+
+GBM-en predikerer bedre enn GLM-en, men forbedringen er moderat: deviansen på test er `r pct(1 - gbm_row$dev_test / glm_row$dev_test)` lavere. Det viktigste bidraget er at den viser *hvor* GLM-en kommer til kort. Partial dependence-kurvene bekrefter at grupperingen av alder fanger hovedtrekkene, mens samspillsanalysen viser at effekten av alder avhenger av bonus/malus-nivået. Det er trolig en stor del av forklaringen på at GBM-en er bedre.
+
+### Hvorfor GLM-en fortsatt er førstevalget for prising
+
+Selv om GBM-en predikerer bedre, har GLM-en flere fordeler i praksis:
+
+- **Tolkbarhet:** Prisen kan skrives som en grunnpris ganget med én faktor per kjennetegn. Hver faktor kan leses direkte og forklares til kunder, ledelse og tilsynsmyndigheter. GBM-en består av `r gbm_res$best_rounds` trær.
+- **Kontroll:** Aktuaren kan justere og glatte faktorene, for eksempel for å sikre at prisen alltid øker med bonus/malus. GBM-en gir en bonus/malus-kurve som ikke er monoton, og predikerer for lavt for kundene med malus.
+- **Stabilitet:** Effektene i en GLM endrer seg lite fra år til år når modellen tilpasses på nytt. Det er viktig for kundene, som ikke bør få store prisendringer uten at noe ved dem har endret seg.
+
+En vanlig arbeidsdeling er derfor å bruke maskinlæring til å finne ikke-lineære effekter og samspill, og så legge de viktigste av dem inn i GLM-en som egne ledd.
+
+### Begrensninger
+
+- **Overdispersjon:** Den anslåtte dispersjonen på `r fmt(glm_res$dispersion, 2)` viser at det finnes variasjon mellom kundene som variablene ikke fanger opp. Den viktigste manglende variabelen er trolig hvor mye kunden kjører. Quasi-Poisson justerer standardfeilene, men endrer ikke prediksjonene.
+- **Bonus/malus bygger på skadehistorikken.** Variabelen er den sterkeste i begge modellene, men den sier lite om nye kunder uten historikk. Den gjør også at effekten av alder må tolkes betinget på bonus/malus, slik samspillsanalysen viste.
+- **Tilfeldig splitt:** Testsettet er trukket tilfeldig fra samme periode som treningssettet. I praksis brukes modellen til å prise neste år, og en test på data fra et senere år ville gitt et mer realistisk bilde. Datasettet har ingen tidsvariabel, så det er ikke mulig her.
+- **Bare skadefrekvens:** Prisen avhenger også av hvor mye hver skade koster. Grupperingene i GLM-en er dessuten valgt manuelt ut fra EDA-en, og andre valg kunne gitt litt andre resultater.
+
+### Videre arbeid
+
+- Legge inn et samspillsledd mellom alder og bonus/malus i GLM-en, og teste med en F-test om det forbedrer modellen. Det er det mest naturlige neste steget, siden GBM-en tyder på at samspillet er reelt.
+- Bruke monotonibetingelser i xgboost, slik at frekvensen alltid øker med bonus/malus, og se hvor mye det koster i prediksjonsevne.
+- Erstatte quasi-Poisson med en negativ binomisk modell, som modellerer overdispersjonen eksplisitt.
+- Modellere skadestørrelse, for eksempel med en gamma-GLM på datasettet `freMTPL2sev` fra samme pakke, og kombinere med frekvensmodellen til en risikopremie.
+
+## Konklusjon
+
+Bonus/malus og førerens alder er de viktigste forklaringsvariablene for skadefrekvens i dette datasettet. Den fulle Poisson-GLM-en reduserer devians på testdata med `r pct(glm_row$forbedring)` sammenlignet med en modell der alle har samme frekvens, og den er godt kalibrert både totalt og per aldersgruppe. Når alder og bonus/malus er med samtidig, blir alderseffekten mye mindre enn EDA-en antydet, fordi unge førere også har høy bonus/malus.
+
+Gradient boosting reduserer devians med `r pct(gbm_row$forbedring)` og viser at effekten av alder avhenger av bonus/malus-nivået. Samtidig gir den en bonus/malus-effekt som ikke er monoton, og den er langt vanskeligere å tolke og kontrollere. Det beste valget for prising er derfor trolig en GLM utvidet med et samspillsledd mellom alder og bonus/malus, der GBM-en brukes som verktøy for å finne slike forbedringer.
 
 ## Referanser
+
+Chen, T. og Guestrin, C. (2016). XGBoost: A scalable tree boosting system. *Proceedings of the 22nd ACM SIGKDD International Conference on Knowledge Discovery and Data Mining*, 785–794.
+
+Friedman, J. H. (2001). Greedy function approximation: A gradient boosting machine. *The Annals of Statistics*, 29(5), 1189–1232.
 
 Noll, A., Salzmann, R. og Wüthrich, M. V. (2018). *Case Study: French Motor Third-Party Liability Claims*. SSRN.
