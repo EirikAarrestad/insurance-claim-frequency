@@ -35,7 +35,7 @@ fmt <- function(x, digits = 3) {
 }
 pct <- function(x, digits = 1) paste0(fmt(100 * x, digits), " %")
 
-# Grupperte variabler (DrivAgeGr osv.) lages i R/01_load_data.R.
+# Grupperte variabler (DrivAgeGrouped osv.) lages i R/01_load_data.R.
 # Her justeres bare variabler for figurene.
 train <- train |>
   mutate(
@@ -143,19 +143,19 @@ I figurene under viser den stiplede linjen den totale skadefrekvensen.
 #| layout-ncol: 2
 #| fig-width: 5
 #| fig-height: 4
-tab_age <- freq_table(DrivAgeGr)
-tab_bm  <- freq_table(BonusMalusGr)
+tab_age <- freq_table(DrivAgeGrouped)
+tab_bm  <- freq_table(BonusMalusGrouped)
 
-plot_freq(tab_age, DrivAgeGr, "Førerens alder")
-plot_freq(tab_bm, BonusMalusGr, "Bonus/malus")
+plot_freq(tab_age, DrivAgeGrouped, "Førerens alder")
+plot_freq(tab_bm, BonusMalusGrouped, "Bonus/malus")
 ```
 
 ```{r}
 #| label: driver-values
-young   <- tab_age$frekvens[tab_age$DrivAgeGr == "18–21"]
-middle  <- tab_age$frekvens[tab_age$DrivAgeGr == "32–41"]
-bm_full <- tab_bm$frekvens[tab_bm$BonusMalusGr == "50"]
-bm_high <- tab_bm$frekvens[tab_bm$BonusMalusGr == "101+"]
+young   <- tab_age$frekvens[tab_age$DrivAgeGrouped == "18–21"]
+middle  <- tab_age$frekvens[tab_age$DrivAgeGrouped == "32–41"]
+bm_full <- tab_bm$frekvens[tab_bm$BonusMalusGrouped == "50"]
+bm_high <- tab_bm$frekvens[tab_bm$BonusMalusGrouped == "101+"]
 ```
 
 Førerens alder og bonus/malus er de to variablene med tydeligst sammenheng med skadefrekvensen (@fig-driver).
@@ -169,7 +169,7 @@ De to variablene henger sammen. I det franske bonus/malus-systemet starter nye f
 #| label: tbl-age-bm
 #| tbl-cap: "Bonus/malus etter førerens alder."
 train |>
-  group_by(`Førerens alder` = DrivAgeGr) |>
+  group_by(`Førerens alder` = DrivAgeGrouped) |>
   summarise(
     `Snitt bonus/malus` = fmt(mean(BonusMalus), 1),
     `Andel med malus (over 100)` = pct(mean(BonusMalus > 100)),
@@ -192,7 +192,7 @@ Det betyr at figurene over delvis viser den samme effekten to ganger: noe av den
 #| fig-width: 5
 #| fig-height: 4
 plot_freq(freq_table(Area), Area, "Områdekode")
-plot_freq(freq_table(DensityGr), DensityGr, "Befolkningstetthet") +
+plot_freq(freq_table(DensityGrouped), DensityGrouped, "Befolkningstetthet") +
   theme(axis.text.x = element_text(angle = 45, hjust = 1))
 ```
 
@@ -228,7 +228,7 @@ Områdekoden og tettheten måler nesten det samme: medianen for tettheten øker 
 #| fig-height: 3.5
 tab_brand <- freq_table(VehBrand)
 
-plot_freq(freq_table(VehAgeGr), VehAgeGr, "Bilens alder (år)")
+plot_freq(freq_table(VehAgeGrouped), VehAgeGrouped, "Bilens alder (år)")
 plot_freq(freq_table(VehPowerF), VehPowerF, "Effektklasse")
 plot_freq(freq_table(VehGas), VehGas, "Drivstoff")
 plot_freq(tab_brand, VehBrand, "Bilmerke")
@@ -267,11 +267,198 @@ Analysen gir fire føringer for modelleringen:
 
 ## Metode
 
-*Kommer.*
+```{r}
+#| label: load-glm
+glm_res <- readRDS("../output/glm_results.rds")
+rr  <- glm_res$relative_risk
+res <- glm_res$results
+
+var_labels <- c(
+  DrivAgeGrouped = "Førerens alder", BonusMalusGrouped = "Bonus/malus",
+  VehAgeGrouped = "Bilens alder", VehPowerF = "Effektklasse",
+  VehGas = "Drivstoff", VehBrand = "Bilmerke",
+  DensityGrouped = "Befolkningstetthet", Region = "Region"
+)
+
+# Relativ risiko med konfidensintervall for ett nivå, f.eks. "1,17 (1,07–1,27)"
+get_rr <- function(v, l) rr[rr$variable == v & rr$level == l, ]
+fmt_rr <- function(r) {
+  paste0(fmt(r$rr, 2), " (", fmt(r$lower, 2), "–", fmt(r$upper, 2), ")")
+}
+ref_level <- function(v) rr$level[rr$variable == v & rr$reference]
+```
+
+### Poisson-GLM
+
+Antall skader $N_i$ for forsikring $i$ modelleres som Poisson-fordelt med forventning lik skadefrekvensen $\lambda_i$ ganget med eksponeringen $e_i$:
+
+$$N_i \sim \text{Poisson}(\lambda_i e_i), \qquad \log \lambda_i = \beta_0 + \sum_j \beta_j x_{ij}.$$
+
+Det gir
+
+$$\log \mathbb{E}[N_i] = \log e_i + \beta_0 + \sum_j \beta_j x_{ij},$$
+
+der $\log e_i$ er et *offset*: et ledd med koeffisient fast lik 1. Slik tar modellen hensyn til at forsikringene har vært aktive i ulik tid, uten at eksponeringen behandles som en forklaringsvariabel.
+
+Med log-lenke blir effektene multiplikative:
+
+$$\lambda_i = e^{\beta_0} \prod_j e^{\beta_j x_{ij}}.$$
+
+$e^{\beta_j}$ er den *relative risikoen*: hvor mye høyere eller lavere skadefrekvensen er i en gruppe sammenlignet med referansegruppen, når de andre variablene holdes like. En relativ risiko på 1,5 betyr 50 % høyere frekvens. Den multiplikative strukturen er også grunnen til at GLM er så utbredt i forsikringsprising: prisen kan uttrykkes som en grunnpris ganget med én faktor per kjennetegn.
+
+### Variabler
+
+Alder, bilens alder, bonus/malus og befolkningstetthet tas inn som grupperte variabler, siden EDA-en viste at sammenhengene ikke er lineære. Effektklasse tas inn som kategorisk variabel. Områdekoden er utelatt, siden den måler nesten det samme som tettheten.
+
+To grupper med svært få forsikringer er slått sammen, fordi de fikk veldig brede konfidensintervaller i en første tilpasning: tetthet 1–5 er slått sammen med 6–30, og effektklasse 12–15 er slått sammen til «12+».
+
+For hver variabel er referansegruppen den med størst eksponering. Konstantleddet $e^{\beta_0}$ er da skadefrekvensen for en kunde i alle referansegruppene: `r fmt(glm_res$baseline)` skader per år.
+
+### Modeller
+
+Tre modeller sammenlignes:
+
+1.  **Nullmodell:** bare konstantledd, altså samme frekvens for alle. Den er sammenligningsgrunnlaget.
+2.  **Førervariabler:** alder og bonus/malus.
+3.  **Full GLM:** alle variablene over.
+
+### Overdispersjon
+
+Poisson-fordelingen har varians lik forventning. Hvis variansen i dataene er større, er det *overdispersjon*. Koeffisientene er fortsatt forventningsrette, men standardfeilene blir for små, og konfidensintervallene for smale.
+
+Dispersjonen anslås som $\hat\phi = \frac{1}{n - p} \sum_i r_i^2$, der $r_i$ er Pearson-residualene og $p$ antall parametere. Konfidensintervaller og tester er beregnet med en quasi-Poisson-modell, som antar $\text{Var}(N_i) = \phi \, \mathbb{E}[N_i]$. Den gir de samme koeffisientene som Poisson-modellen, men skalerer standardfeilene med $\sqrt{\hat\phi}$. Bidraget fra hver variabel testes med en F-test, quasi-Poisson-versjonen av likelihood ratio-testen.
+
+### Evaluering
+
+Modellene evalueres på testsettet med gjennomsnittlig Poisson-devians:
+
+$$D = \frac{2}{n} \sum_{i=1}^{n} \left[ N_i \log \frac{N_i}{\hat\mu_i} - (N_i - \hat\mu_i) \right],$$
+
+der $\hat\mu_i$ er predikert antall skader og $0 \log 0 = 0$. Devians er det naturlige målet for Poisson-data, og lavere er bedre. I tillegg sjekkes *kalibreringen*: om predikert antall skader stemmer med observert, totalt og per gruppe. For prising er det minst like viktig, siden en modell som treffer feil nivå gir feil pris for hele porteføljen.
 
 ## Resultater
 
-*Kommer.*
+### Modellsammenligning
+
+```{r}
+#| label: tbl-models
+#| tbl-cap: "Sammenligning av modellene. Devians er gjennomsnittlig Poisson-devians. Forbedringen er reduksjonen i devians på testdata sammenlignet med nullmodellen."
+res |>
+  transmute(
+    Modell = modell,
+    Parametere = parametere,
+    AIC = fmt(aic, 0),
+    `Devians trening` = fmt(dev_train, 4),
+    `Devians test` = fmt(dev_test, 4),
+    Forbedring = ifelse(forbedring == 0, "–", pct(forbedring))
+  ) |>
+  kable(align = "lrrrrr")
+```
+
+```{r}
+#| label: model-values
+improvement  <- res$forbedring[res$modell == "Full GLM"]
+share_driver <- (res$dev_test[1] - res$dev_test[2]) /
+                (res$dev_test[1] - res$dev_test[3])
+```
+
+Den fulle modellen reduserer devians på testdata med `r pct(improvement)` sammenlignet med nullmodellen (@tbl-models). Omtrent `r pct(share_driver, 0)` av forbedringen kommer fra alder og bonus/malus alene. Devians er nesten lik på trening og test, så modellen er ikke overtilpasset.
+
+En forbedring på noen få prosent kan virke lite, men er typisk for skadefrekvens. Om en enkelt kunde melder en skade akkurat i år, er i stor grad tilfeldig, og den delen av variasjonen kan ingen modell forklare. Det modellen kan, er å skille grupper med høy og lav forventet frekvens, og det er det prisingen trenger.
+
+### Hvilke variabler betyr mest?
+
+```{r}
+#| label: tbl-ftest
+#| tbl-cap: "F-test for hver variabel: hvor mye dårligere modellen blir når variabelen fjernes. Sortert etter F-verdi."
+ft <- glm_res$f_tests
+dev_full <- ft$Deviance[1]
+ft <- ft[-1, ]
+
+data.frame(
+  Variabel = unname(var_labels[rownames(ft)]),
+  Frihetsgrader = ft$Df,
+  `Økning i devians` = fmt(ft$Deviance - dev_full, 0),
+  `F-verdi` = fmt(ft[["F value"]], 1),
+  `p-verdi` = format.pval(ft[["Pr(>F)"]], digits = 2, eps = 1e-16),
+  check.names = FALSE
+)[order(-ft[["F value"]]), ] |>
+  kable(row.names = FALSE, align = "lrrrr")
+```
+
+Bonus/malus er den klart viktigste variabelen, etterfulgt av førerens alder (@tbl-ftest). Alle variablene bidrar signifikant, også etter justering for overdispersjon. Med over en halv million observasjoner blir imidlertid selv små effekter signifikante, så størrelsen på effektene er mer interessant enn p-verdiene.
+
+### Relative risikoer
+
+```{r}
+#| label: fig-rr
+#| fig-cap: "Relative risikoer med 95 % konfidensintervall, sammenlignet med referansegruppen (relativ risiko 1, stiplet linje). Logaritmisk skala."
+#| fig-height: 6
+rr_plot <- rr |>
+  filter(variable %in% c("DrivAgeGrouped", "BonusMalusGrouped", "VehAgeGrouped", "DensityGrouped")) |>
+  mutate(
+    variable = factor(var_labels[variable],
+                      levels = var_labels[c("DrivAgeGrouped", "BonusMalusGrouped",
+                                            "VehAgeGrouped", "DensityGrouped")]),
+    id = paste0(variable, ":", level),
+    id = factor(id, levels = rev(unique(id)))
+  )
+
+ggplot(rr_plot, aes(x = rr, y = id, xmin = lower, xmax = upper)) +
+  geom_vline(xintercept = 1, linetype = "dashed") +
+  geom_pointrange(aes(colour = reference), size = 0.3) +
+  scale_colour_manual(values = c("FALSE" = fill_col, "TRUE" = "grey50"),
+                      guide = "none") +
+  scale_x_log10() +
+  scale_y_discrete(labels = function(x) sub(".*:", "", x)) +
+  facet_wrap(~ variable, scales = "free_y", ncol = 2) +
+  labs(x = "Relativ risiko (log-skala)", y = NULL)
+```
+
+```{r}
+#| label: rr-values
+age_rr   <- rr[rr$variable == "DrivAgeGrouped", ]
+lowest   <- age_rr[which.min(age_rr$rr), ]
+dens_rr  <- rr[rr$variable == "DensityGrouped", ]
+brand_rr <- rr[rr$variable == "VehBrand" & !rr$reference, ]
+reg_rr   <- rr[rr$variable == "Region" & !rr$reference, ]
+```
+
+**Alder.** Det viktigste funnet er at aldersmønsteret endrer seg når bonus/malus er med i modellen (@fig-rr). I EDA-en hadde førere på 18–21 år over tre ganger så høy skadefrekvens som eldre førere. I modellen er den relative risikoen for 18–21 år bare `r fmt_rr(get_rr("DrivAgeGrouped", "18–21"))`, sammenlignet med referansegruppen `r ref_level("DrivAgeGrouped")` år. Grunnen er overlappen fra EDA-en: unge førere starter på bonus/malus 100, så det meste av risikoen deres forklares allerede av bonus/malus-nivået.
+
+Lavest risiko, gitt bonus/malus, har førere på `r lowest$level` år, med relativ risiko `r fmt_rr(lowest)`. En mulig forklaring er at bonus/malus betyr ulike ting i ulike aldre. En fører i slutten av 20-årene har ikke hatt tid til å opparbeide full bonus, selv uten skader, mens en eldre fører med samme nivå sannsynligvis har hatt skader. Effekten av alder avhenger altså av bonus/malus-nivået. Det er en *samspillseffekt*, som modellen ikke fanger opp, siden den antar at effektene ganges sammen uavhengig av hverandre.
+
+**Bonus/malus.** Risikoen øker kraftig med bonus/malus-nivået. Førere med malus (over 100) har en relativ risiko på `r fmt_rr(get_rr("BonusMalusGrouped", "101+"))` sammenlignet med full bonus, nesten like mye som i EDA-en. Bonus/malus fanger altså opp risiko som de andre variablene ikke forklarer, noe som gir mening siden nivået bygger på kundens egen skadehistorikk.
+
+**Bilens alder og tetthet.** Biler eldre enn 15 år har `r pct(1 - get_rr("VehAgeGrouped", "16+")$rr, 0)` lavere risiko enn biler på `r ref_level("VehAgeGrouped")` år, med relativ risiko `r fmt_rr(get_rr("VehAgeGrouped", "16+"))`. Risikoen øker jevnt med befolkningstettheten, fra `r fmt(dens_rr$rr[1], 2)` i de mest grisgrendte kommunene til `r fmt(dens_rr$rr[nrow(dens_rr)], 2)` i de tetteste. Toppen for de mest grisgrendte kommunene i EDA-en forsvant: gruppen var så liten at den ga et svært bredt intervall, og den er slått sammen med neste gruppe.
+
+**Andre variabler.** Dieselbiler har relativ risiko `r fmt_rr(get_rr("VehGas", "Diesel"))` sammenlignet med bensin, og effektklasse 12 eller høyere `r fmt_rr(get_rr("VehPowerF", "12+"))` sammenlignet med klasse `r ref_level("VehPowerF")`. For bilmerke varierer den relative risikoen fra `r fmt(min(brand_rr$rr), 2)` til `r fmt(max(brand_rr$rr), 2)`, og for region fra `r fmt(min(reg_rr$rr), 2)` til `r fmt(max(reg_rr$rr), 2)`. Mange av regioneffektene har brede intervaller som inkluderer 1.
+
+### Overdispersjon
+
+Den anslåtte dispersjonen er $\hat\phi =$ `r fmt(glm_res$dispersion, 2)`. Variansen i dataene er altså omtrent `r pct(glm_res$dispersion - 1, 0)` større enn Poisson-modellen antar, og standardfeilene fra en vanlig Poisson-modell ville vært omtrent `r fmt(sqrt(glm_res$dispersion), 2)` ganger for små. Konfidensintervallene og testene over er justert for dette med quasi-Poisson. Overdispersjonen tyder på at det finnes variasjon mellom kundene som variablene ikke fanger opp, for eksempel hvor mye kunden kjører.
+
+### Kalibrering
+
+```{r}
+#| label: fig-calibration
+#| fig-cap: "Observert og predikert skadefrekvens på testdata, etter førerens alder."
+cal <- glm_res$calibration$age
+age_levels <- levels(train$DrivAgeGrouped)
+
+cal_long <- data.frame(
+  alder = factor(rep(cal$level, 2), levels = age_levels),
+  type = rep(c("Observert", "Predikert"), each = nrow(cal)),
+  frekvens = c(cal$observert, cal$predikert)
+)
+
+ggplot(cal_long, aes(x = alder, y = frekvens, fill = type)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = c("Observert" = "grey65", "Predikert" = fill_col)) +
+  labs(x = "Førerens alder", y = "Skader per forsikringsår", fill = NULL)
+```
+
+Modellen predikerer `r fmt(glm_res$totals[["predikert"]], 0)` skader i testsettet, mot `r fmt(glm_res$totals[["observert"]], 0)` observerte, et avvik på `r pct(abs(glm_res$totals[["predikert"]] / glm_res$totals[["observert"]] - 1), 1)`. Den treffer også godt innenfor hver aldersgruppe (@fig-calibration), inkludert de unge førerne, der dataene er minst.
 
 ## Diskusjon
 
@@ -280,4 +467,3 @@ Analysen gir fire føringer for modelleringen:
 ## Referanser
 
 Noll, A., Salzmann, R. og Wüthrich, M. V. (2018). *Case Study: French Motor Third-Party Liability Claims*. SSRN.
-
